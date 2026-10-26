@@ -55,6 +55,16 @@ def num(v, default=0):
     return v
 
 
+def tasa(v):
+    """Vacío si no hay dato o es 0; decimales con coma (1.78 -> '1,78')."""
+    v = num(v, None)
+    if v is None or v == 0:
+        return None
+    if isinstance(v, float):
+        return f"{v:g}".replace(".", ",")
+    return v
+
+
 def dias_trabajados_por_contrato(df: pd.DataFrame) -> dict:
     """Días trabajados = parcial4 de sueldoBase (respaldo: totalesEmpl)."""
     out = {}
@@ -78,8 +88,8 @@ def transformar(df: pd.DataFrame) -> pd.DataFrame:
             "Id del concepto": r["concepto"],
             "Monto del concepto": num(r["monto"]),
             "Afecto": num(r["baseCalc"]),
-            "Id de institución": r["institucion"] if not pd.isna(r["institucion"]) else 0,
-            "Cotización de jubilación": num(r["parcial1"]),
+            "Id de institución": r["institucion"] if not pd.isna(r["institucion"]) else None,
+            "Cotización de jubilación": tasa(r["parcial1"]),
             "Días de licencias": num(r["parcial5"]),
             "Días trabajados": dias_trab.get(clave, 0),
             "Fecha de aplicación": r["fechaAplic"],
