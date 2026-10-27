@@ -6,12 +6,20 @@ Ejecutar:
     streamlit run app.py
 """
 import io
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import pandas as pd
 import streamlit as st
 
 # ─────────────────────────── Lógica de transformación ───────────────────────────
 
 CONCEPTOS_EXCLUIDOS = {"variables_empleado"}
+
+COLUMNAS_ENTERAS = [
+    "Número de contrato", "Monto del concepto", "Afecto", "Días de licencias",
+    "Días trabajados", "Total de rebajas por LLSS", "Rentas no gravadas",
+    "Rebaja por zona extrema", "Días de vacaciones", "Monto Init", "Fase",
+    "Parcial 7", "Parcial 8",
+]
 
 COLUMNAS_SALIDA = [
     "Fecha de proceso", "Id empleado", "Número de contrato", "Id del concepto",
@@ -48,21 +56,48 @@ def leer_tabla_resultados(contenido: bytes) -> pd.DataFrame:
 
 
 def num(v, default=0):
+    """Valor entero sin decimales (redondeo al entero más cercano, .5 hacia arriba)."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return default
-    if isinstance(v, float) and v.is_integer():
-        return int(v)
-    return v
+    try:
+        return int(Decimal(str(v)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return v
 
 
 def tasa(v):
     """Vacío si no hay dato o es 0; decimales con coma (1.78 -> '1,78')."""
-    v = num(v, None)
-    if v is None or v == 0:
+    if v is None or (isinstance(v, float) and pd.isna(v)) or v == 0:
         return None
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
     if isinstance(v, float):
         return f"{v:g}".replace(".", ",")
     return v
+
+
+def leer_horas_semanales(fuente) -> dict:
+    """Lee 'Horas semanales' y devuelve {(empleado, contrato): horasSema}."""
+    crudo = pd.read_excel(fuente, header=None)
+    filas = crudo.index[crudo.apply(
+        lambda r: r.astype(str).str.strip().eq("horasSema").any(), axis=1)]
+    if len(filas) == 0:
+        raise ValueError("No se encontró la columna 'horasSema' en el archivo de Horas semanales.")
+    if hasattr(fuente, "seek"):
+        fuente.seek(0)
+    h = pd.read_excel(fuente, header=filas[0])
+    h.columns = [str(c).strip() for c in h.columns]
+    h["empleado"] = h["empleado"].astype(str).str.strip().str.upper()
+    h["contrato"] = pd.to_numeric(h["contrato"], errors="coerce")
+    h["horasSema"] = pd.to_numeric(h["horasSema"], errors="coerce")
+    return {(e, c): hs for e, c, hs in zip(h["empleado"], h["contrato"], h["horasSema"])}
+
+
+def jornada(horas):
+    """'C' si las horas semanales son mayores a 30, si no 'P'. Vacío si no hay dato."""
+    if horas is None or pd.isna(horas):
+        return None
+    return "C" if horas > 30 else "P"
 
 
 def dias_trabajados_por_contrato(df: pd.DataFrame) -> dict:
@@ -74,7 +109,8 @@ def dias_trabajados_por_contrato(df: pd.DataFrame) -> dict:
     return out
 
 
-def transformar(df: pd.DataFrame) -> pd.DataFrame:
+def transformar(df: pd.DataFrame, horas: dict | None = None) -> pd.DataFrame:
+    horas = horas or {}
     df = df[~df["concepto"].isin(CONCEPTOS_EXCLUIDOS)].copy()
     dias_trab = dias_trabajados_por_contrato(df)
     filas = []
@@ -97,20 +133,30 @@ def transformar(df: pd.DataFrame) -> pd.DataFrame:
             "Total de rebajas por LLSS": num(r["parcial2"]) if es_impuesto else 0,
             "Rentas no gravadas": num(r["parcial3"]) if es_impuesto else 0,
             "Rebaja por zona extrema": 0,
-            "Jornada": None,
+            "Jornada": jornada(horas.get(
+                (str(r["empleado"]).strip().upper(), pd.to_numeric(r["contrato"], errors="coerce")))),
             "Días de vacaciones": 0,
             "Monto Init": num(r["montoInit"]),
             "Fase": num(r["fase_id"], 1),
             "Parcial 7": num(r["parcial7"]),
             "Parcial 8": num(r["parcial8"]),
         })
-    return pd.DataFrame(filas, columns=COLUMNAS_SALIDA)
+    out = pd.DataFrame(filas, columns=COLUMNAS_SALIDA)
+    # Todas las columnas numéricas como enteros (sin decimales), salvo Cotización de jubilación
+    for c in COLUMNAS_ENTERAS:
+        out[c] = pd.to_numeric(out[c], errors="coerce").round().astype("Int64")
+    return out
 
 
 def a_excel(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, sheet_name="Liquidaciones", index=False)
+        ws = w.sheets["Liquidaciones"]
+        for j, c in enumerate(COLUMNAS_SALIDA, start=1):
+            if c in COLUMNAS_ENTERAS:
+                for fila in range(2, ws.max_row + 1):
+                    ws.cell(row=fila, column=j).number_format = "0"
     return buf.getvalue()
 
 
@@ -129,14 +175,20 @@ h1, h2, h3 { color: #1565C0; }
 """, unsafe_allow_html=True)
 
 st.title("Tabla de Resultados → Liquidaciones Detalle")
-st.caption("Carga la consulta de la Tabla de Resultados de Rex+ y descarga el archivo de carga de liquidaciones.")
+st.caption("Carga la Tabla de Resultados de Rex+ y el archivo de Horas semanales, y descarga el archivo de carga de liquidaciones.")
 
-archivo = st.file_uploader("Tabla de Resultados (.xlsx)", type=["xlsx", "xls"])
+col_a, col_b = st.columns(2)
+archivo = col_a.file_uploader("1. Tabla de Resultados (.xlsx)", type=["xlsx", "xls"])
+archivo_horas = col_b.file_uploader("2. Horas semanales (.xlsx)", type=["xlsx", "xls"])
 
-if archivo is not None:
+if archivo is not None and archivo_horas is None:
+    st.warning("Falta cargar el archivo de Horas semanales para definir la Jornada (C > 30 hrs, P ≤ 30 hrs).")
+
+if archivo is not None and archivo_horas is not None:
     try:
         entrada = leer_tabla_resultados(archivo.getvalue())
-        salida = transformar(entrada)
+        horas = leer_horas_semanales(io.BytesIO(archivo_horas.getvalue()))
+        salida = transformar(entrada, horas)
     except Exception as e:
         st.error(f"No se pudo procesar el archivo: {e}")
         st.stop()
@@ -146,6 +198,17 @@ if archivo is not None:
     c2.metric("Filas generadas", len(salida))
     c3.metric("Empleados", salida["Id empleado"].nunique())
     c4.metric("Períodos", ", ".join(sorted(salida["Fecha de proceso"].astype(str).unique())))
+
+    contratos = salida.drop_duplicates(["Id empleado", "Número de contrato"])
+    j1, j2, j3 = st.columns(3)
+    j1.metric("Contratos jornada C", int((contratos["Jornada"] == "C").sum()))
+    j2.metric("Contratos jornada P", int((contratos["Jornada"] == "P").sum()))
+    sin_horas = contratos[contratos["Jornada"].isna()]
+    j3.metric("Sin horas semanales", len(sin_horas))
+    if len(sin_horas):
+        st.warning("Estos empleados/contratos no están en el archivo de Horas semanales; "
+                   "su Jornada queda en blanco:")
+        st.dataframe(sin_horas[["Id empleado", "Número de contrato"]], hide_index=True)
 
     excluidas = len(entrada) - len(salida)
     if excluidas:
