@@ -14,6 +14,32 @@ import streamlit as st
 
 CONCEPTOS_EXCLUIDOS = {"variables_empleado"}
 
+# Conceptos que NO se pueden cargar: el usuario debe crear un concepto nuevo y reemplazarlos
+CONCEPTOS_NO_PERMITIDOS = [
+    "recargoMi", "remvarMi", "tratoMi", "bonsupMi", "benefMi", "otremMi", "pagosindMi",
+    "sobresueldoMi", "comisionMi", "AguinaldoMi", "BonoMi", "participacionMi", "becaMi",
+    "otingrMi", "viaticoMi", "gastoMi", "salaCMi", "indemMMi", "indemNMi", "indvolMi",
+    "indcontMi", "asigPerdCajaMi", "AsigDesgHerrMi", "AsigTeletrabajoMi", "TraslacionMi",
+    "alojamientoTrabajoMi", "imptoindMi", "cuotavivMi", "credMi", "otrdescMi", "CuotaSindMi",
+    "otrosDesctoMi", "AnticipoPrestamoMi",
+]
+
+
+def detectar_no_permitidos(df: pd.DataFrame) -> pd.Series:
+    """Cantidad de filas por cada concepto no permitido presente en la entrada."""
+    sub = df[df["concepto"].isin(CONCEPTOS_NO_PERMITIDOS)]
+    return sub["concepto"].value_counts().reindex(
+        [c for c in CONCEPTOS_NO_PERMITIDOS if c in set(sub["concepto"])])
+
+
+def aplicar_reemplazos(df: pd.DataFrame, reemplazos: dict) -> pd.DataFrame:
+    """Reemplaza el Id de concepto según {concepto_no_permitido: concepto_nuevo}."""
+    if not reemplazos:
+        return df
+    df = df.copy()
+    df["concepto"] = df["concepto"].replace(reemplazos)
+    return df
+
 COLUMNAS_ENTERAS = [
     "Número de contrato", "Monto del concepto", "Afecto", "Días de licencias",
     "Días trabajados", "Total de rebajas por LLSS", "Rentas no gravadas",
@@ -188,7 +214,54 @@ if archivo is not None and archivo_horas is not None:
     try:
         entrada = leer_tabla_resultados(archivo.getvalue())
         horas = leer_horas_semanales(io.BytesIO(archivo_horas.getvalue()))
-        salida = transformar(entrada, horas)
+    except Exception as e:
+        st.error(f"No se pudo procesar el archivo: {e}")
+        st.stop()
+
+    # ── Validación de conceptos no permitidos ──
+    id_archivo = f"{archivo.name}-{archivo.size}"
+    if st.session_state.get("archivo_actual") != id_archivo:
+        st.session_state["archivo_actual"] = id_archivo
+        st.session_state["reemplazos"] = {}
+    reemplazos = st.session_state["reemplazos"]
+
+    no_permitidos = detectar_no_permitidos(entrada)
+    pendientes = [c for c in no_permitidos.index if c not in reemplazos]
+
+    if len(no_permitidos):
+        st.subheader("Conceptos no permitidos")
+        if pendientes:
+            st.error(f"El archivo trae {len(no_permitidos)} concepto(s) que no se pueden cargar. "
+                     "Crea un concepto nuevo en Rex+ para cada uno, escribe su ID y presiona "
+                     "**Aplicar cambio**.")
+        else:
+            st.success("Todos los conceptos no permitidos fueron reemplazados.")
+
+        h1c, h2c, h3c, h4c = st.columns([3, 1.3, 3, 1.6])
+        h1c.markdown("**Concepto no permitido**")
+        h2c.markdown("**Filas**")
+        h3c.markdown("**ID del concepto nuevo**")
+        for concepto, n in no_permitidos.items():
+            c_1, c_2, c_3, c_4 = st.columns([3, 1.3, 3, 1.6])
+            c_1.markdown(f"`{concepto}`")
+            c_2.markdown(f"{n}")
+            nuevo = c_3.text_input("ID nuevo", key=f"nuevo_{concepto}",
+                                   value=reemplazos.get(concepto, ""),
+                                   label_visibility="collapsed", placeholder="Ej: AguinaldoNuevo")
+            if c_4.button("Aplicar cambio", key=f"aplicar_{concepto}"):
+                nuevo = (nuevo or "").strip()
+                if not nuevo:
+                    c_3.error("Escribe el ID del concepto nuevo.")
+                elif nuevo in CONCEPTOS_NO_PERMITIDOS:
+                    c_3.error(f"'{nuevo}' también es un concepto no permitido.")
+                else:
+                    reemplazos[concepto] = nuevo
+                    st.rerun()
+            if concepto in reemplazos:
+                c_4.markdown(f"✅ → `{reemplazos[concepto]}`")
+
+    try:
+        salida = transformar(aplicar_reemplazos(entrada, reemplazos), horas)
     except Exception as e:
         st.error(f"No se pudo procesar el archivo: {e}")
         st.stop()
@@ -216,12 +289,19 @@ if archivo is not None and archivo_horas is not None:
                 f"{', '.join(sorted(CONCEPTOS_EXCLUIDOS))}.")
 
     st.subheader("Vista previa")
-    st.dataframe(salida, use_container_width=True, hide_index=True)
+    vista = salida.copy()
+    vista["Cotización de jubilación"] = vista["Cotización de jubilación"].map(
+        lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v))
+    st.dataframe(vista, width="stretch", hide_index=True)
 
-    periodo = "_".join(sorted(salida["Fecha de proceso"].astype(str).unique()))
-    st.download_button(
-        "⬇️ Descargar archivo de carga",
-        data=a_excel(salida),
-        file_name=f"liq_detalle_{periodo}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if pendientes:
+        st.warning("La descarga está bloqueada hasta reemplazar todos los conceptos no permitidos: "
+                   + ", ".join(pendientes))
+    else:
+        periodo = "_".join(sorted(salida["Fecha de proceso"].astype(str).unique()))
+        st.download_button(
+            "⬇️ Descargar archivo de carga",
+            data=a_excel(salida),
+            file_name=f"liq_detalle_{periodo}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
